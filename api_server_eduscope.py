@@ -1,7 +1,7 @@
 # api_server_eduscope.py — EduScope FastAPI Server
 # Endpoints: /identify /ask-tutor /quiz /practical-record /stream /latest /health /spc
 # Run: gunicorn api_server_eduscope:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
-# NOTE: TFLite inference runs on WhiteMouse Pod (RPi Zero 2W) — NOT on Render.
+# NOTE: ONNX inference runs on WhiteMouse Pod (RPi Zero 2W) — NOT on Render.
 #       Render hosts only the Claude tutor, quiz, practical-record, SSE, and health endpoints.
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,60 +24,60 @@ app.add_middleware(
 )
 
 # ── Model loading (RPi only — stubbed on Render) ──────────────────────────────
-# TFLite inference runs on the WhiteMouse Pod hardware.
+# ONNX inference runs on the WhiteMouse Pod hardware.
 # On Render (cloud), _interp is None and /identify returns 503.
 _interp = None
 _IN     = None
 _OUT    = None
 
 try:
-    try:
-        import tflite_runtime.interpreter as _tflite_lib
-    except ImportError:
-        import tensorflow.lite as _tflite_lib
-
-    _TFLITE = os.path.join(cfg.EXPORT_DIR, cfg.TFLITE_MODEL_NAME)
-    if os.path.exists(_TFLITE):
-        _interp = _tflite_lib.Interpreter(model_path=_TFLITE)
-        _interp.allocate_tensors()
-        _IN  = _interp.get_input_details()[0]
-        _OUT = _interp.get_output_details()[0]
-        print("[model] ✓ TFLite model loaded")
+    import onnxruntime as ort
+    
+    _ONNX_PATH = os.path.join(cfg.EXPORT_DIR, "eduscope_mobilenet_int8.onnx")
+    if os.path.exists(_ONNX_PATH):
+        _interp = ort.InferenceSession(_ONNX_PATH)
+        _IN  = _interp.get_inputs()[0]
+        _OUT = _interp.get_outputs()[0]
+        print(f"[model] ✓ ONNX model loaded from {_ONNX_PATH}")
+        print(f"[model]   Input:  {_IN.name}, shape={_IN.shape}, dtype={_IN.type}")
+        print(f"[model]   Output: {_OUT.name}, shape={_OUT.shape}, dtype={_OUT.type}")
     else:
-        print("[model] ⚠ Model file not found — inference disabled (cloud mode)")
+        print(f"[model] ⚠ Model file not found: {_ONNX_PATH} — inference disabled (cloud mode)")
 except Exception as e:
-    print(f"[model] ⚠ TFLite not available — inference disabled (cloud mode): {e}")
+    print(f"[model] ⚠ ONNX runtime not available — inference disabled (cloud mode): {e}")
 
 _latest: dict = {}          # stores last inference result for /latest and SSE
 _sse_subscribers: list = [] # list of async queues for SSE clients
 
 
 def preprocess(img: Image.Image) -> np.ndarray:
-    """Resize image, normalise with ImageNet mean/std, quantise to INT8."""
+    """Resize image, normalize with ImageNet mean/std, return FLOAT32 for ONNX."""
     img_resized = img.resize((cfg.IMG_SIZE, cfg.IMG_SIZE))
     arr = np.array(img_resized, dtype=np.float32) / 255.0
     arr = (arr - np.array(cfg.IMG_MEAN)) / np.array(cfg.IMG_STD)
     arr = np.transpose(arr, (2, 0, 1))    # HWC → CHW
     arr = arr[np.newaxis]                  # [1, 3, 224, 224]
-    in_sc, in_zp = _IN["quantization"]
-    return (arr / in_sc + in_zp).astype(np.int8)
+    return arr.astype(np.float32)
 
 
 def run_inference(img: Image.Image):
-    """Run TFLite inference. Returns (class_name, confidence, probabilities_dict)."""
+    """Run ONNX inference. Returns (class_name, confidence, probabilities_dict)."""
     if _interp is None:
-        raise RuntimeError("TFLite model not available on this server — run on WhiteMouse Pod")
+        raise RuntimeError("ONNX model not available on this server — run on WhiteMouse Pod")
+    
     inp = preprocess(img)
-    _interp.set_tensor(_IN["index"], inp)
-    _interp.invoke()
-    out_sc, out_zp = _OUT["quantization"]
-    q      = _interp.get_tensor(_OUT["index"])[0]
-    logits = (q.astype(np.float32) - out_zp) * out_sc
-    probs  = np.exp(logits) / np.exp(logits).sum()
-    pi     = int(probs.argmax())
-    cls    = cfg.CLASS_NAMES[pi]
-    conf   = float(probs[pi])
+    
+    # Run ONNX inference
+    outputs = _interp.run([_OUT.name], {_IN.name: inp})
+    logits = outputs[0][0]  # Shape: [num_classes]
+    
+    # Convert logits to probabilities
+    probs = np.exp(logits) / np.exp(logits).sum()
+    pi = int(probs.argmax())
+    cls = cfg.CLASS_NAMES[pi]
+    conf = float(probs[pi])
     probs_dict = {cfg.CLASS_NAMES[i]: float(probs[i]) for i in range(cfg.NUM_CLASSES)}
+    
     return cls, conf, probs_dict
 
 
@@ -97,7 +97,7 @@ async def _notify_sse_subscribers(result: dict):
 @app.post("/identify")
 async def identify_specimen(file: UploadFile = File(...)):
     """Identify a microscope specimen from an uploaded image.
-    Only works when running on WhiteMouse Pod with TFLite model present.
+    Only works when running on WhiteMouse Pod with ONNX model present.
     Returns 503 on Render (cloud) — inference is edge-only.
     """
     if _interp is None:
@@ -228,7 +228,7 @@ def latest():
 def health():
     return {
         "status":        "ok",
-        "model":         "eduscope-tflite-int8",
+        "model":         "eduscope-onnx-int8",
         "inference":     "available" if _interp else "cloud-mode (RPi only)",
         "classes":       cfg.NUM_CLASSES,
         "version":       "1.0.0",
