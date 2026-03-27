@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import numpy as np, io, time, os, json, asyncio
 from PIL import Image
-import config as cfg
+import eduscope_config as cfg
 from eduscope_rca import identify
 from eduscope_claude import (explain_specimen, answer_student_question,
                                generate_quiz, generate_practical_record)

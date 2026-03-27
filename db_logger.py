@@ -14,7 +14,7 @@ import sqlite3, json, time, os
 from datetime import datetime, date
 from pathlib import Path
 from typing import List, Optional
-import config as cfg
+import eduscope_config as cfg
 
 CLAUDE_DAILY_LIMIT = 20   # calls per device per day — edit here to change
 DB_PATH            = "eduscope.db"

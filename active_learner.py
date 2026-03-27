@@ -5,7 +5,7 @@ import sqlite3, json, csv, argparse, time
 from datetime import datetime, date
 from pathlib import Path
 from typing import List
-import config as cfg
+import eduscope_config as cfg
 from db_logger import _get_conn
 
 # 🔥 Tuned for EduScope (slightly higher threshold)

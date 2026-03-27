@@ -3,7 +3,7 @@
 # Used by api_server_eduscope.py and eduscope_claude.py
 from dataclasses import dataclass
 from typing import List
-import config as cfg
+import eduscope_config as cfg
 
 BIO_KB = {
     "AMOEBA": {

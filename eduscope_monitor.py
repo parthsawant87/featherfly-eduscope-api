@@ -3,7 +3,7 @@
 import argparse, time, json
 from datetime import datetime, date, timedelta
 from pathlib import Path
-import config as cfg
+import eduscope_config as cfg
 from db_logger import get_recent
 
 ALERT_LOG_PATH = Path(cfg.LOG_DIR) / "eduscope_alerts.json"
