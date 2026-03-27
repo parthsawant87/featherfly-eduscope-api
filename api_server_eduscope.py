@@ -1,7 +1,8 @@
 # api_server_eduscope.py — EduScope FastAPI Server
 # Endpoints: /identify /ask-tutor /quiz /practical-record /stream /latest /health /spc
-# Run: gunicorn api_server_eduscope:app --workers 1 --bind 0.0.0.0:8001
-# NOTE: gunicorn --workers 1 is intentional for RPi Zero 2W (512MB RAM)
+# Run: gunicorn api_server_eduscope:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+# NOTE: TFLite inference runs on WhiteMouse Pod (RPi Zero 2W) — NOT on Render.
+#       Render hosts only the Claude tutor, quiz, practical-record, SSE, and health endpoints.
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,23 +23,37 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Model loading ─────────────────────────────────────────────────────────────
-_TFLITE = os.path.join(cfg.EXPORT_DIR, cfg.TFLITE_MODEL_NAME)
+# ── Model loading (RPi only — stubbed on Render) ──────────────────────────────
+# TFLite inference runs on the WhiteMouse Pod hardware.
+# On Render (cloud), _interp is None and /identify returns 503.
+_interp = None
+_IN     = None
+_OUT    = None
+
 try:
-    import tflite_runtime.interpreter as _tflite_lib
-except:
-    import tensorflow.lite as _tflite_lib
-_interp = _tflite_lib.Interpreter(model_path=_TFLITE)
-_interp.allocate_tensors()
-_IN  = _interp.get_input_details()[0]
-_OUT = _interp.get_output_details()[0]
-_latest: dict = {}                          # stores last inference result for /latest and SSE
-_sse_subscribers: list = []                 # list of async queues for SSE clients
+    try:
+        import tflite_runtime.interpreter as _tflite_lib
+    except ImportError:
+        import tensorflow.lite as _tflite_lib
+
+    _TFLITE = os.path.join(cfg.EXPORT_DIR, cfg.TFLITE_MODEL_NAME)
+    if os.path.exists(_TFLITE):
+        _interp = _tflite_lib.Interpreter(model_path=_TFLITE)
+        _interp.allocate_tensors()
+        _IN  = _interp.get_input_details()[0]
+        _OUT = _interp.get_output_details()[0]
+        print("[model] ✓ TFLite model loaded")
+    else:
+        print("[model] ⚠ Model file not found — inference disabled (cloud mode)")
+except Exception as e:
+    print(f"[model] ⚠ TFLite not available — inference disabled (cloud mode): {e}")
+
+_latest: dict = {}          # stores last inference result for /latest and SSE
+_sse_subscribers: list = [] # list of async queues for SSE clients
 
 
 def preprocess(img: Image.Image) -> np.ndarray:
     """Resize image, normalise with ImageNet mean/std, quantise to INT8."""
-    # ← fixed: original was missing the resize + numpy steps
     img_resized = img.resize((cfg.IMG_SIZE, cfg.IMG_SIZE))
     arr = np.array(img_resized, dtype=np.float32) / 255.0
     arr = (arr - np.array(cfg.IMG_MEAN)) / np.array(cfg.IMG_STD)
@@ -50,12 +65,14 @@ def preprocess(img: Image.Image) -> np.ndarray:
 
 def run_inference(img: Image.Image):
     """Run TFLite inference. Returns (class_name, confidence, probabilities_dict)."""
+    if _interp is None:
+        raise RuntimeError("TFLite model not available on this server — run on WhiteMouse Pod")
     inp = preprocess(img)
     _interp.set_tensor(_IN["index"], inp)
     _interp.invoke()
     out_sc, out_zp = _OUT["quantization"]
     q      = _interp.get_tensor(_OUT["index"])[0]
-    logits = (q.astype(np.float32) - out_zp) * out_sc   # ← fixed: was used before definition
+    logits = (q.astype(np.float32) - out_zp) * out_sc
     probs  = np.exp(logits) / np.exp(logits).sum()
     pi     = int(probs.argmax())
     cls    = cfg.CLASS_NAMES[pi]
@@ -79,7 +96,15 @@ async def _notify_sse_subscribers(result: dict):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.post("/identify")
 async def identify_specimen(file: UploadFile = File(...)):
-    """Identify a microscope specimen from an uploaded image."""
+    """Identify a microscope specimen from an uploaded image.
+    Only works when running on WhiteMouse Pod with TFLite model present.
+    Returns 503 on Render (cloud) — inference is edge-only.
+    """
+    if _interp is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Inference not available on cloud server — connect WhiteMouse Pod for local inference"
+        )
     global _latest
     try:
         data = await file.read()
@@ -105,7 +130,6 @@ async def identify_specimen(file: UploadFile = File(...)):
         _latest = result
         log_prediction(result, module="eduscope")
         flag_if_uncertain(result)
-        # Push to SSE subscribers — instant update to dashboard
         await _notify_sse_subscribers(result)
         return JSONResponse(result)
     except Exception as e:
@@ -154,7 +178,7 @@ async def practical_record(req: PracticalRequest):
 async def sse_stream():
     """Server-Sent Events endpoint.
     Dashboard connects once and receives instant push when specimen is identified.
-    Replaces setInterval polling — latency drops from 2–3s to ~50ms.
+    Replaces setInterval polling — latency drops from 2-3s to ~50ms.
 
     Usage (JavaScript):
         const es = new EventSource(API + '/stream');
@@ -167,20 +191,19 @@ async def sse_stream():
     _sse_subscribers.append(queue)
 
     async def event_generator():
-        # Send initial heartbeat so client knows connection is live
         yield ": heartbeat\n\n"
         if _latest:
             yield f"data: {json.dumps(_latest)}\n\n"
         try:
             while True:
                 try:
-                    # Wait for new result, send heartbeat every 15s to keep connection alive
                     result = await asyncio.wait_for(queue.get(), timeout=15.0)
                     yield f"data: {json.dumps(result)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"   # keepalive comment — not a data event
+                    yield ": heartbeat\n\n"
         except asyncio.CancelledError:
-            _sse_subscribers.remove(queue)
+            if queue in _sse_subscribers:
+                _sse_subscribers.remove(queue)
             raise
 
     return StreamingResponse(
@@ -188,7 +211,7 @@ async def sse_stream():
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering if proxied
+            "X-Accel-Buffering": "no",
         }
     )
 
@@ -204,8 +227,9 @@ def latest():
 @app.get("/health")
 def health():
     return {
-        "status":   "ok",
-        "model":   "eduscope-tflite-int8",
-        "classes": cfg.NUM_CLASSES,
-        "version": "1.0.0",
+        "status":        "ok",
+        "model":         "eduscope-tflite-int8",
+        "inference":     "available" if _interp else "cloud-mode (RPi only)",
+        "classes":       cfg.NUM_CLASSES,
+        "version":       "1.0.0",
     }
